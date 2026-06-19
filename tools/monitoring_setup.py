@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -197,9 +198,40 @@ def check_alertmanager(url: str) -> bool:
     return False
 
 
+METRIC_REF_RE = r"[A-Za-z_:][A-Za-z0-9_:]*(?:\s*\{[^{}]*\})?(?:\s*\[[^\[\]]+\])?"
+DIVISION_RE = re.compile(
+    rf"(?<![A-Za-z0-9_:])(?P<left>{METRIC_REF_RE})\s*/\s*(?P<right>{METRIC_REF_RE})(?![A-Za-z0-9_:])"
+)
+
+
+def _normalize_metric_ref(metric_ref: str) -> str:
+    return re.sub(r"\s+", "", metric_ref)
+
+
+def validate_alert_rule_expressions(rules: List[Dict[str, Any]]) -> List[str]:
+    errors = []
+    for rule in rules:
+        name = rule.get("name", "<unnamed>")
+        expr = str(rule.get("expr", ""))
+        for match in DIVISION_RE.finditer(expr):
+            left = _normalize_metric_ref(match.group("left"))
+            right = _normalize_metric_ref(match.group("right"))
+            if left == right:
+                errors.append(f"{name}: expression divides {left} by itself")
+                break
+    return errors
+
+
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
+    validation_errors = validate_alert_rule_expressions(rules)
+    if validation_errors:
+        print("Invalid alert rule expressions:", file=sys.stderr)
+        for error in validation_errors:
+            print(f"  - {error}", file=sys.stderr)
+        return False
+
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
 
@@ -414,13 +446,15 @@ def main():
                 args.alertmanager_url, args.slack_webhook,
                 args.pagerduty_key, args.dry_run)
 
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
+        if not upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run):
+            return 1
         print("Monitoring initialization complete")
         return 0
 
     if args.alerts:
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
-        return 0
+        return 0 if upload_prometheus_rules(
+            RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run
+        ) else 1
 
     if args.backup:
         return 0 if backup_monitoring_config(
