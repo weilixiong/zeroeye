@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -372,6 +373,26 @@ def backup_monitoring_config(output_dir: str, prometheus_url: str,
     return True
 
 
+def validate_alert_expressions(rules: List[Dict[str, Any]]) -> bool:
+    """
+    Validate alert rules configuration for self-dividing expressions.
+    Returns False if any self-dividing expressions are found, True otherwise.
+    """
+    self_dividing_pattern = re.compile(r'\b(\w+)\s*/\s*\1\b')
+    all_valid = True
+    for rule in rules:
+        name = rule.get("name")
+        expr = rule.get("expr")
+        if expr:
+            match = self_dividing_pattern.search(expr)
+            if match:
+                print(f"  ✗ Validation Alert: Alert rule '{name}' has a self-dividing expression: '{expr}' (divided by '{match.group(1)}')")
+                all_valid = False
+            else:
+                print(f"  ✓ Alert rule '{name}' expression is valid")
+    return all_valid
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Monitoring setup tool")
     parser.add_argument("--prometheus-url", default=DEFAULT_PROMETHEUS_URL)
@@ -429,19 +450,20 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        alerts_ok = validate_alert_expressions(RECOMMENDED_ALERT_RULES)
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
         ]
-        all_ok = True
+        endpoints_ok = True
         for url in configs_to_check:
             result = http_request("GET", f"{url}/-/healthy")
             if result:
                 print(f"  {url}: OK")
             else:
                 print(f"  {url}: FAILED")
-                all_ok = False
-        return 0 if all_ok else 1
+                endpoints_ok = False
+        return 0 if (alerts_ok and endpoints_ok) else 1
 
     parser.print_help()
     return 0
