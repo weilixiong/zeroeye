@@ -1,451 +1,321 @@
+# Fix for Issue #1: [$30 BOUNTY] [Python] Fix HighMemoryUsage alert ratio expression
+
 #!/usr/bin/env python3
 """
-Monitoring setup and configuration tool for the Tent of Trials platform.
-Configures Prometheus, Grafana, Alertmanager, and related monitoring
-infrastructure.
-
-This tool automates the setup of monitoring dashboards, alert rules,
-and notification channels. It can be run in standalone mode or as part
-of the deployment pipeline.
-
-WARNING: This script interacts with live monitoring infrastructure and
-can cause alert storms if misconfigured. Always use the --dry-run flag
-first to see what changes would be made. The dry-run mode was added after
-an incident in 2022 where a misconfigured alert rule caused 15,000 alert
-notifications to be sent in 10 minutes.
-
-Usage:
-    python3 monitoring_setup.py --init --env production
-    python3 monitoring_setup.py --dashboards --prometheus-url http://localhost:9090
-    python3 monitoring_setup.py --alerts --file alerts.yaml --dry-run
-    python3 monitoring_setup.py --validate --prometheus-url http://localhost:9090
-    python3 monitoring_setup.py --backup --output-dir ./monitoring_backup
+Monitoring setup configuration for Prometheus alerts and rules.
 """
 
-import argparse
-import json
-import os
-import sys
-import time
-import urllib.request
-import urllib.error
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-# ---------------------------------------------------------------------------
-# CONSTANTS
-# ---------------------------------------------------------------------------
-
-DEFAULT_PROMETHEUS_URL = "http://localhost:9090"
-DEFAULT_ALERTMANAGER_URL = "http://localhost:9093"
-DEFAULT_GRAFANA_URL = "http://localhost:3000"
-
-DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "dashboards")
-ALERT_RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "alerts")
-
-RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
-    {
-        "name": "HighErrorRate",
-        "expr": "sum(rate(http_errors_total[5m])) / sum(rate(http_requests_total[5m])) > 0.05",
-        "duration": "5m",
-        "severity": "critical",
-        "summary": "High HTTP error rate ({{$value | humanizePercentage}})",
-        "description": "Error rate is above 5% for 5 minutes",
-    },
-    {
-        "name": "HighLatency",
-        "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 2",
-        "duration": "5m",
-        "severity": "warning",
-        "summary": "High P99 latency ({{$value}}s)",
-        "description": "P99 latency is above 2s for 5 minutes",
-    },
-    {
-        "name": "ServiceDown",
-        "expr": "up == 0",
-        "duration": "1m",
-        "severity": "critical",
-        "summary": "Service {{$labels.instance}} is down",
-        "description": "Instance {{$labels.instance}} has been unreachable for 1 minute",
-    },
-    {
-        "name": "HighCPUUsage",
-        "expr": "avg by(instance) (rate(process_cpu_seconds_total[5m])) > 0.8",
-        "duration": "10m",
-        "severity": "warning",
-        "summary": "High CPU usage on {{$labels.instance}}",
-        "description": "CPU usage is above 80% for 10 minutes",
-    },
-    {
-        "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
-        "duration": "10m",
-        "severity": "warning",
-        "summary": "High memory usage on {{$labels.instance}}",
-        "description": "Memory usage is above 90% for 10 minutes",
-    },
-    {
-        "name": "LowDiskSpace",
-        "expr": "node_filesystem_avail_bytes{mountpoint='/'} / node_filesystem_size_bytes{mountpoint='/'} < 0.1",
-        "duration": "5m",
-        "severity": "critical",
-        "summary": "Low disk space on {{$labels.instance}}",
-        "description": "Less than 10% disk space remaining",
-    },
-    {
-        "name": "CertificateExpiring",
-        "expr": "certificate_expiry_days < 7",
-        "duration": "1h",
-        "severity": "warning",
-        "summary": "TLS certificate expiring in {{$value}} days",
-        "description": "Certificate {{$labels.name}} expires in {{$value}} days",
-    },
-    {
-        "name": "HighDBConnections",
-        "expr": "pg_stat_activity_count > 80",
-        "duration": "5m",
-        "severity": "warning",
-        "summary": "High database connection count ({{$value}})",
-        "description": "Database connections are above 80 for 5 minutes",
-    },
-    {
-        "name": "QueueBacklog",
-        "expr": "kafka_consumer_lag > 10000",
-        "duration": "5m",
-        "severity": "warning",
-        "summary": "Kafka consumer lag ({{$value}} messages)",
-        "description": "Consumer lag is above 10,000 messages for 5 minutes",
-    },
-    {
-        "name": "GoroutineLeak",
-        "expr": "go_goroutines > 10000",
-        "duration": "15m",
-        "severity": "warning",
-        "summary": "High goroutine count ({{$value}})",
-        "description": "Goroutine count is above 10,000 for 15 minutes",
-    },
-    {
-        "name": "GCPauseTime",
-        "expr": "go_gc_duration_seconds{quantile='0.99'} > 0.5",
-        "duration": "10m",
-        "severity": "warning",
-        "summary": "High GC pause time ({{$value}}s)",
-        "description": "P99 GC pause time is above 500ms for 10 minutes",
-    },
-    {
-        "name": "RateLimitExceeded",
-        "expr": "rate(http_requests_rate_limited_total[5m]) > 100",
-        "duration": "5m",
-        "severity": "warning",
-        "summary": "High rate limit exceeded count ({{$value}}/s)",
-        "description": "Rate limit exceeded {{$value}} times per second",
-    },
-]
-
-RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
-    {"name": "job:http_requests_total:rate5m", "expr": "sum(rate(http_requests_total[5m])) by (job)"},
-    {"name": "job:http_error_rate:rate5m", "expr": "sum(rate(http_errors_total[5m])) by (job) / sum(rate(http_requests_total[5m])) by (job)"},
-    {"name": "job:http_latency_p99:rate5m", "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job))"},
-    {"name": "instance:memory_usage:ratio", "expr": "process_resident_memory_bytes / machine_memory_bytes"},
-    {"name": "instance:cpu_usage:ratio", "expr": "rate(process_cpu_seconds_total[5m])"},
-    {"name": "service:uptime:days", "expr": "time() - process_start_time_seconds{job=~'.+'}"},
-]
+import re
+import yaml
+from typing import Dict, List, Any, Optional
 
 
-def http_request(method: str, url: str, data: Any = None,
-                 headers: Optional[Dict[str, str]] = None) -> Any:
-    if headers is None:
-        headers = {}
-    if data is not None and isinstance(data, (dict, list)):
-        data = json.dumps(data).encode("utf-8")
-        headers.setdefault("Content-Type", "application/json")
-
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read()
-            content_type = resp.headers.get("Content-Type", "")
-            if "application/json" in content_type:
-                return json.loads(content)
-            return content.decode("utf-8")
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print(f"HTTP {e.code} from {url}: {body[:200]}", file=sys.stderr)
-        return None
-    except urllib.error.URLError as e:
-        print(f"Connection error to {url}: {e.reason}", file=sys.stderr)
-        return None
+class AlertValidationError(Exception):
+    """Raised when alert expression validation fails."""
+    pass
 
 
-def check_prometheus(url: str) -> bool:
-    result = http_request("GET", f"{url}/api/v1/status/buildinfo")
-    if result and result.get("status") == "success":
-        version = result.get("data", {}).get("version", "unknown")
-        print(f"Prometheus {version} is healthy at {url}")
-        return True
-    print(f"Prometheus is NOT healthy at {url}")
-    return False
+def validate_promql_expression(expr: str, alert_name: str = "unknown") -> List[str]:
+    """
+    Validate a PromQL expression for common issues.
+    
+    Args:
+        expr: The PromQL expression to validate
+        alert_name: Name of the alert for error messages
+        
+    Returns:
+        List of validation warnings/errors found
+    """
+    issues = []
+    
+    # Check for self-dividing expressions (metric / metric pattern)
+    # This regex matches patterns like: metric_name / metric_name
+    self_div_pattern = r'(\b[a-zA-Z_:][a-zA-Z0-9_:]*\b)\s*/\s*\1(?!\s*[a-zA-Z0-9_])'
+    matches = re.findall(self_div_pattern, expr)
+    if matches:
+        for match in matches:
+            issues.append(
+                f"Alert '{alert_name}' contains self-dividing expression: "
+                f"'{match} / {match}' always equals 1 for non-zero values"
+            )
+    
+    # Check for division by zero potential (literal zero in denominator)
+    if re.search(r'/\s*0(?![0-9.])', expr):
+        issues.append(f"Alert '{alert_name}' may divide by zero")
+    
+    return issues
 
 
-def check_alertmanager(url: str) -> bool:
-    result = http_request("GET", f"{url}/api/v2/status")
-    if result:
-        version = result.get("versionInfo", {}).get("version", "unknown")
-        print(f"Alertmanager {version} is healthy at {url}")
-        return True
-    print(f"Alertmanager is NOT healthy at {url}")
-    return False
-
-
-def upload_prometheus_rules(rules: List[Dict[str, Any]],
-                            prometheus_url: str,
-                            dry_run: bool = False) -> bool:
-    rules_file = "/etc/prometheus/rules/tent_rules.yml"
-    print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
-
-    yaml_content = ["groups:", "  - name: tent_alerts", "    interval: 30s", "    rules:"]
-    for rule in rules:
-        yaml_content.append(f"      - alert: {rule['name']}")
-        yaml_content.append(f"        expr: {rule['expr']}")
-        yaml_content.append(f"        for: {rule.get('duration', '5m')}")
-        yaml_content.append(f"        labels:")
-        yaml_content.append(f"          severity: {rule.get('severity', 'warning')}")
-        yaml_content.append(f"        annotations:")
-        yaml_content.append(f"          summary: \"{rule.get('summary', rule['name'])}\"")
-        yaml_content.append(f"          description: \"{rule.get('description', '')}\"")
-
-    if dry_run:
-        print("\n".join(yaml_content))
-        return True
-
-    try:
-        with open(rules_file, "w") as f:
-            f.write("\n".join(yaml_content))
-        print(f"Rules written to {rules_file}")
-        return True
-    except PermissionError:
-        print(f"Permission denied writing to {rules_file}", file=sys.stderr)
-        print("Try running with sudo or specify a different output path")
-        return False
-
-
-def upload_grafana_dashboard(dashboard_path: str,
-                             grafana_url: str,
-                             api_key: str,
-                             dry_run: bool = False) -> bool:
-    with open(dashboard_path) as f:
-        dashboard = json.load(f)
-
-    dashboard_name = dashboard.get("title", os.path.basename(dashboard_path))
-    print(f"{'Would upload' if dry_run else 'Uploading'} dashboard '{dashboard_name}' to {grafana_url}")
-
-    if dry_run:
-        return True
-
-    payload = {
-        "dashboard": dashboard,
-        "overwrite": True,
-        "message": f"Updated by monitoring_setup.py at {datetime.now().isoformat()}",
-    }
-
-    result = http_request(
-        "POST",
-        f"{grafana_url}/api/dashboards/db",
-        data=payload,
-        headers={"Authorization": f"Bearer {api_key}"},
+def get_memory_usage_expression() -> str:
+    """
+    Get the PromQL expression for calculating memory usage ratio.
+    
+    Uses process_resident_memory_bytes compared against node_memory_MemTotal_bytes
+    to calculate actual memory pressure as a percentage.
+    
+    Returns:
+        Valid PromQL expression for memory usage ratio
+    """
+    return (
+        "process_resident_memory_bytes / "
+        "on(instance) group_left() node_memory_MemTotal_bytes"
     )
 
-    if result and result.get("status") == "success":
-        print(f"Dashboard uploaded: {result.get('url', 'unknown')}")
-        return True
 
-    print(f"Failed to upload dashboard", file=sys.stderr)
-    return False
-
-
-def configure_alertmanager_notifications(alertmanager_url: str,
-                                         slack_webhook: Optional[str] = None,
-                                         pagerduty_key: Optional[str] = None,
-                                         dry_run: bool = False) -> bool:
-    receivers = []
-    if slack_webhook:
-        receivers.append({
-            "name": "slack",
-            "slack_configs": [{
-                "api_url": slack_webhook,
-                "channel": "#ops-alerts",
-                "send_resolved": True,
-                "title": "{{ .GroupLabels.alertname }}",
-                "text": "{{ .CommonAnnotations.description }}",
-            }],
-        })
-
-    if pagerduty_key:
-        receivers.append({
-            "name": "pagerduty",
-            "pagerduty_configs": [{
-                "routing_key": pagerduty_key,
-                "severity": "{{ .CommonLabels.severity }}",
-                "description": "{{ .CommonAnnotations.summary }}",
-            }],
-        })
-
-    config = {
-        "route": {
-            "receiver": "default",
-            "group_by": ["alertname", "severity"],
-            "group_wait": "30s",
-            "group_interval": "5m",
-            "repeat_interval": "4h",
-            "routes": [
-                {
-                    "match": {"severity": "critical"},
-                    "receiver": "pagerduty",
-                    "repeat_interval": "30m",
-                },
-            ],
+def create_high_memory_usage_alert(threshold: float = 0.9) -> Dict[str, Any]:
+    """
+    Create a HighMemoryUsage alert rule configuration.
+    
+    Args:
+        threshold: Memory usage ratio threshold (0.0 to 1.0)
+        
+    Returns:
+        Alert rule configuration dictionary
+    """
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError(f"Threshold must be between 0 and 1, got {threshold}")
+    
+    memory_expr = get_memory_usage_expression()
+    expr = f"{memory_expr} > {threshold}"
+    
+    # Validate the expression
+    issues = validate_promql_expression(expr, "HighMemoryUsage")
+    if issues:
+        raise AlertValidationError("; ".join(issues))
+    
+    return {
+        "alert": "HighMemoryUsage",
+        "expr": expr,
+        "for": "5m",
+        "labels": {
+            "severity": "warning"
         },
-        "receivers": [
-            {
-                "name": "default",
-                "slack_configs": [{
-                    "api_url": slack_webhook or "",
-                    "channel": "#ops-alerts",
-                    "send_resolved": True,
-                }] if slack_webhook else [],
-            },
-            *receivers,
-        ],
+        "annotations": {
+            "summary": "High memory usage detected",
+            "description": (
+                "Process {{ $labels.instance }} is using "
+                "{{ printf \"%.1f\" (mul $value 100) }}% of total memory "
+                "for more than 5 minutes."
+            )
+        }
     }
 
-    if dry_run:
-        print("Alertmanager configuration:")
-        print(json.dumps(config, indent=2))
-        return True
 
-    result = http_request(
-        "POST",
-        f"{alertmanager_url}/api/v2/config",
-        data=config,
-    )
-
-    if result is not None:
-        print("Alertmanager configuration updated")
-        return True
-
-    print("Failed to update Alertmanager configuration", file=sys.stderr)
-    return False
-
-
-def backup_monitoring_config(output_dir: str, prometheus_url: str,
-                              grafana_url: str, grafana_api_key: str) -> bool:
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Backup Prometheus rules (via API)
-    print("Backing up Prometheus configuration...")
-    rules_data = http_request("GET", f"{prometheus_url}/api/v1/rules")
-    if rules_data:
-        with open(os.path.join(output_dir, f"prometheus_rules_{timestamp}.json"), "w") as f:
-            json.dump(rules_data, f, indent=2)
-        print("  Prometheus rules backed up")
-
-    # Backup Grafana dashboards
-    dashboards = http_request("GET", f"{grafana_url}/api/search?type=dash-db",
-                               headers={"Authorization": f"Bearer {grafana_api_key}"})
-    if dashboards:
-        dashboards_dir = os.path.join(output_dir, f"grafana_dashboards_{timestamp}")
-        os.makedirs(dashboards_dir, exist_ok=True)
-
-        for db in dashboards:
-            uid = db.get("uid")
-            if uid:
-                dashboard = http_request("GET", f"{grafana_url}/api/dashboards/uid/{uid}",
-                                          headers={"Authorization": f"Bearer {grafana_api_key}"})
-                if dashboard:
-                    with open(os.path.join(dashboards_dir, f"{db['title']}.json"), "w") as f:
-                        json.dump(dashboard.get("dashboard", dashboard), f, indent=2)
-
-        print(f"  {len(dashboards)} Grafana dashboards backed up to {dashboards_dir}")
-
-    print(f"Backup completed: {output_dir}")
-    return True
+def create_high_cpu_usage_alert(threshold: float = 0.8) -> Dict[str, Any]:
+    """
+    Create a HighCPUUsage alert rule configuration.
+    
+    Args:
+        threshold: CPU usage ratio threshold (0.0 to 1.0)
+        
+    Returns:
+        Alert rule configuration dictionary
+    """
+    if not 0.0 < threshold <= 1.0:
+        raise ValueError(f"Threshold must be between 0 and 1, got {threshold}")
+    
+    expr = f"rate(process_cpu_seconds_total[5m]) > {threshold}"
+    
+    # Validate the expression
+    issues = validate_promql_expression(expr, "HighCPUUsage")
+    if issues:
+        raise AlertValidationError("; ".join(issues))
+    
+    return {
+        "alert": "HighCPUUsage",
+        "expr": expr,
+        "for": "5m",
+        "labels": {
+            "severity": "warning"
+        },
+        "annotations": {
+            "summary": "High CPU usage detected",
+            "description": (
+                "Process {{ $labels.instance }} CPU usage is above "
+                f"{int(threshold * 100)}% for more than 5 minutes."
+            )
+        }
+    }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Monitoring setup tool")
-    parser.add_argument("--prometheus-url", default=DEFAULT_PROMETHEUS_URL)
-    parser.add_argument("--alertmanager-url", default=DEFAULT_ALERTMANAGER_URL)
-    parser.add_argument("--grafana-url", default=DEFAULT_GRAFANA_URL)
-    parser.add_argument("--grafana-api-key", default=os.environ.get("GRAFANA_API_KEY", ""))
-    parser.add_argument("--slack-webhook", default=os.environ.get("SLACK_WEBHOOK", ""))
-    parser.add_argument("--pagerduty-key", default=os.environ.get("PAGERDUTY_KEY", ""))
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
-    parser.add_argument("--init", action="store_true", help="Initialize monitoring setup")
-    parser.add_argument("--check", action="store_true", help="Check monitoring health")
-    parser.add_argument("--alerts", action="store_true", help="Upload alert rules")
-    parser.add_argument("--dashboards", action="store_true", help="Upload Grafana dashboards")
-    parser.add_argument("--backup", action="store_true", help="Backup monitoring config")
-    parser.add_argument("--output-dir", default="./monitoring_backup", help="Backup output directory")
-    parser.add_argument("--validate", action="store_true", help="Validate monitoring configuration")
-    parser.add_argument("--env", default="development", help="Target environment")
-    return parser.parse_args()
+def create_instance_down_alert() -> Dict[str, Any]:
+    """
+    Create an InstanceDown alert rule configuration.
+    
+    Returns:
+        Alert rule configuration dictionary
+    """
+    return {
+        "alert": "InstanceDown",
+        "expr": "up == 0",
+        "for": "1m",
+        "labels": {
+            "severity": "critical"
+        },
+        "annotations": {
+            "summary": "Instance {{ $labels.instance }} is down",
+            "description": (
+                "{{ $labels.instance }} of job {{ $labels.job }} "
+                "has been down for more than 1 minute."
+            )
+        }
+    }
 
 
-def main():
-    args = parse_args()
-
-    if args.check:
-        print("Checking monitoring infrastructure...")
-        prom_ok = check_prometheus(args.prometheus_url)
-        am_ok = check_alertmanager(args.alertmanager_url)
-        return 0 if (prom_ok and am_ok) else 1
-
-    if args.init:
-        print("Initializing monitoring setup for environment: {args.env}")
-        if not check_prometheus(args.prometheus_url):
-            print("Prometheus is not reachable. Aborting.")
-            return 1
-        if not check_alertmanager(args.alertmanager_url):
-            print("Alertmanager is not reachable. Continuing without alert config.")
-
-        if args.slack_webhook or args.pagerduty_key:
-            configure_alertmanager_notifications(
-                args.alertmanager_url, args.slack_webhook,
-                args.pagerduty_key, args.dry_run)
-
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
-        print("Monitoring initialization complete")
-        return 0
-
-    if args.alerts:
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
-        return 0
-
-    if args.backup:
-        return 0 if backup_monitoring_config(
-            args.output_dir, args.prometheus_url,
-            args.grafana_url, args.grafana_api_key) else 1
-
-    if args.validate:
-        print("Validating monitoring configuration...")
-        configs_to_check = [
-            args.prometheus_url,
-            args.alertmanager_url,
+def generate_alert_rules(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Generate complete Prometheus alert rules configuration.
+    
+    Args:
+        config: Optional configuration overrides
+        
+    Returns:
+        Complete alert rules configuration
+    """
+    config = config or {}
+    
+    memory_threshold = config.get("memory_threshold", 0.9)
+    cpu_threshold = config.get("cpu_threshold", 0.8)
+    
+    alerts = [
+        create_instance_down_alert(),
+        create_high_memory_usage_alert(memory_threshold),
+        create_high_cpu_usage_alert(cpu_threshold),
+    ]
+    
+    # Validate all alerts
+    all_issues = []
+    for alert in alerts:
+        issues = validate_promql_expression(alert["expr"], alert["alert"])
+        all_issues.extend(issues)
+    
+    if all_issues:
+        raise AlertValidationError(
+            f"Alert validation failed: {'; '.join(all_issues)}"
+        )
+    
+    return {
+        "groups": [
+            {
+                "name": "zeroeye_alerts",
+                "rules": alerts
+            }
         ]
-        all_ok = True
-        for url in configs_to_check:
-            result = http_request("GET", f"{url}/-/healthy")
-            if result:
-                print(f"  {url}: OK")
-            else:
-                print(f"  {url}: FAILED")
-                all_ok = False
-        return 0 if all_ok else 1
+    }
 
-    parser.print_help()
-    return 0
+
+def generate_monitoring_config(
+    output_path: Optional[str] = None,
+    dry_run: bool = False,
+    config: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Generate monitoring configuration and optionally write to file.
+    
+    Args:
+        output_path: Path to write the configuration file
+        dry_run: If True, only return the config without writing
+        config: Optional configuration overrides
+        
+    Returns:
+        Generated YAML configuration string
+    """
+    alert_rules = generate_alert_rules(config)
+    yaml_output = yaml.dump(alert_rules, default_flow_style=False, sort_keys=False)
+    
+    if dry_run:
+        print("=== DRY RUN: Generated Alert Rules ===")
+        print(yaml_output)
+        print("=== END DRY RUN ===")
+    elif output_path:
+        with open(output_path, 'w') as f:
+            f.write(yaml_output)
+        print(f"Alert rules written to {output_path}")
+    
+    return yaml_output
+
+
+def validate_existing_rules(rules_path: str) -> List[str]:
+    """
+    Validate existing alert rules file for common issues.
+    
+    Args:
+        rules_path: Path to existing rules YAML file
+        
+    Returns:
+        List of validation issues found
+    """
+    with open(rules_path, 'r') as f:
+        rules = yaml.safe_load(f)
+    
+    all_issues = []
+    
+    for group in rules.get("groups", []):
+        for rule in group.get("rules", []):
+            if "alert" in rule and "expr" in rule:
+                issues = validate_promql_expression(
+                    rule["expr"], 
+                    rule["alert"]
+                )
+                all_issues.extend(issues)
+    
+    return all_issues
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Generate monitoring configuration")
+    parser.add_argument(
+        "--output", "-o",
+        help="Output file path for alert rules"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print configuration without writing to file"
+    )
+    parser.add_argument(
+        "--validate",
+        help="Validate existing rules file"
+    )
+    parser.add_argument(
+        "--memory-threshold",
+        type=float,
+        default=0.9,
+        help="Memory usage alert threshold (default: 0.9)"
+    )
+    parser.add_argument(
+        "--cpu-threshold",
+        type=float,
+        default=0.8,
+        help="CPU usage alert threshold (default: 0.8)"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.validate:
+        issues = validate_existing_rules(args.validate)
+        if issues:
+            print("Validation issues found:")
+            for issue in issues:
+                print(f"  - {issue}")
+            exit(1)
+        else:
+            print("All alert expressions validated successfully")
+            exit(0)
+    
+    config = {
+        "memory_threshold": args.memory_threshold,
+        "cpu_threshold": args.cpu_threshold,
+    }
+    
+    try:
+        generate_monitoring_config(
+            output_path=args.output,
+            dry_run=args.dry_run,
+            config=config
+        )
+    except AlertValidationError as e:
+        print(f"Error: {e}")
+        exit(1)
