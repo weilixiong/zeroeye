@@ -28,12 +28,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from copy import deepcopy
 
 try:
     import yaml
-    HAS_YAML = True
-except ImportError:
-    HAS_YAML = False
 
 try:
     import toml
@@ -168,77 +169,79 @@ ENV_OVERRIDES: Dict[str, Dict[str, Any]] = {
 
 SENSITIVE_KEYS = [
     "database.password", "redis.password", "auth.jwt_secret",
-    "auth.jwt_secret", "auth.jwt_secret",
-]
+    "database.password",
+    "redis.password",
+    "auth.jwt_secret",
+    "auth.api_key",
+}
 
 
-def merge_config(base: Dict, override: Dict) -> Dict:
-    result = dict(base)
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+# HELPER FUNCTIONS
+# ---------------------------------------------------------------------------
+
+def merge_dicts(base: Dict[str, Any], override: Dict[str, Any], *, _copy: bool = True) -> Dict[str, Any]:
+    """
+    Recursively merge `override` into `base`.
+
+    config = dict(DEFAULT_CONFIG)
+    if env in ENV_OVERRIDES:
+    Returns:
+        A new dictionary with merged values.
+    """
+    result = deepcopy(base) if _copy else base
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = merge_config(result[key], value)
-        else:
+            result[key] = merge_dicts(result[key], value)
+    masked = {}
             result[key] = value
     return result
 
+def generate_config(env: str, *, _base: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Generate a configuration dictionary for the given environment.
 
-def generate_config(env: str, overrides: Optional[Dict] = None) -> Dict:
-    config = dict(DEFAULT_CONFIG)
-    if env in ENV_OVERRIDES:
-        config = merge_config(config, ENV_OVERRIDES[env])
-    if overrides:
-        config = merge_config(config, overrides)
-    return config
-
-
-def mask_sensitive(config: Dict, prefix: str = "") -> Dict:
-    masked = {}
-    for key, value in config.items():
-        full_key = f"{prefix}.{key}" if prefix else key
-        if full_key in SENSITIVE_KEYS:
-            masked[key] = "***REDACTED***"
-        elif isinstance(value, dict):
-            masked[key] = mask_sensitive(value, full_key)
-        else:
             masked[key] = value
     return masked
 
+    Returns:
+        The merged configuration dictionary.
+    """
+    base = _base if _base is not None else DEFAULT_CONFIG
+    config = deepcopy(base)
+    env_lower = env.lower()
 
-def to_yaml(config: Dict) -> str:
-    if not HAS_YAML:
-        return "ERROR: PyYAML is not installed"
-    return yaml.dump(config, default_flow_style=False, sort_keys=False)
-
-
+    if env_lower in ENV_OVERRIDES:
 def to_json(config: Dict, pretty: bool = True) -> str:
     if pretty:
-        return json.dumps(config, indent=2, default=str)
-    return json.dumps(config, default=str)
+    return config
 
 
-def to_toml(config: Dict) -> str:
-    if not HAS_TOML:
-        return "ERROR: toml is not installed"
+def mask_sensitive(config: Dict[str, Any], sensitive_keys: set = None, *, _path: str = "") -> Dict[str, Any]:
+    """
+    Return a copy of the config with sensitive values masked.
+
 
     def flatten(config: Dict, prefix: str = "") -> Dict:
         result = {}
         for key, value in config.items():
             full_key = f"{prefix}.{key}" if prefix else key
             if isinstance(value, dict):
-                result.update(flatten(value, full_key))
+    """
+    if sensitive_keys is None:
+        sensitive_keys = SENSITIVE_KEYS
+    result: Dict[str, Any] = {}
+    for key, value in config.items():
+        full_key = f"{_path}.{key}" if _path else key
+        if isinstance(value, dict):
+            result[key] = mask_sensitive(value, sensitive_keys, _path=full_key)
+        else:
+            if full_key in sensitive_keys:
+                result[key] = "***REDACTED***"
             else:
-                result[full_key] = value
-        return result
+                result[key] = value
+    return result
 
-    flat = flatten(config)
-    lines = []
-    for key, value in flat.items():
-        parts = key.split(".")
-        if len(parts) > 1:
-            section = parts[0]
-            sub_key = ".".join(parts[1:])
-            if not any(line.startswith(f"[{section}]") for line in lines):
-                lines.append(f"\n[{section}]")
             if isinstance(value, str):
                 lines.append(f'{sub_key} = "{value}"')
             elif isinstance(value, bool):

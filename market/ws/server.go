@@ -2,26 +2,68 @@ package ws
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
-
 	"github.com/gorilla/websocket"
 	"github.com/tent-of-trials/market/matching"
 	"github.com/tent-of-trials/market/types"
 	"go.uber.org/zap"
+	"go.uber.org/zap"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+// defaultAllowedOrigins contains safe defaults for local development.
+// These are overridden by the ALLOWED_ORIGINS environment variable.
+var defaultAllowedOrigins = []string{
+	"http://localhost",
+	"http://localhost:3000",
+	"http://localhost:8080",
+	"http://127.0.0.1",
+	"http://127.0.0.1:3000",
+	"http://127.0.0.1:8080",
+}
+
+// getAllowedOrigins returns the list of allowed origins from the ALLOWED_ORIGINS
+// environment variable (comma-separated), or the default local development origins.
+func getAllowedOrigins() []string {
+	if env := os.Getenv("ALLOWED_ORIGINS"); env != "" {
+		parts := strings.Split(env, ",")
+		origins := make([]string, 0, len(parts))
+		for _, o := range parts {
+			if trimmed := strings.TrimSpace(o); trimmed != "" {
+				origins = append(origins, trimmed)
+			}
+		}
+		return origins
+	}
+	return defaultAllowedOrigins
+}
+
+// isOriginAllowed checks if the given origin is in the allowed list.
+// It uses constant-time comparison to mitigate timing attacks.
+func isOriginAllowed(origin string, allowed []string) bool {
+	for _, a := range allowed {
+		if subtle.ConstantTimeCompare([]byte(origin), []byte(a)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func newUpgrader() websocket.Upgrader {
+	return websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin:     checkOrigin,
+	}
 }
 
 type Client struct {
-	hub      *Hub
 	conn     *websocket.Conn
 	send     chan []byte
 	subs     map[types.Symbol]struct{}
@@ -53,12 +95,13 @@ func NewHub(logger *zap.Logger) *Hub {
 		unregister: make(chan *Client),
 		broadcast:  make(chan []byte, 256),
 		logger:     logger,
-	}
+	logger     *zap.Logger
+	port       int
+	srv        *http.Server
+	allowedOrigins []string
 }
 
-func (h *Hub) Run() {
-	for {
-		select {
+func NewHub(logger *zap.Logger) *Hub {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = struct{}{}
@@ -83,15 +126,16 @@ func (h *Hub) Run() {
 		case message := <-h.broadcast:
 			h.mu.RLock()
 			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					delete(h.clients, client)
-				}
-			}
-			h.mu.RUnlock()
-		}
+	}
+}
+
+func NewServer(hub *Hub, engine *matching.MatchingEngine, logger *zap.Logger, port int, allowedOrigins []string) *Server {
+	return &Server{
+		hub:            hub,
+		engine:         engine,
+		logger:         logger,
+		port:           port,
+		allowedOrigins: allowedOrigins,
 	}
 }
 
@@ -109,12 +153,13 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/v1/trades", s.handleGetTrades)
-	mux.HandleFunc("/api/v1/depth", s.handleGetDepth)
+}
 
-	s.srv = &http.Server{
-		Addr:         fmt.Sprintf(":%d", s.port),
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
+func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	upgrader := newUpgrader()
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.logger.Error("websocket upgrade failed", zap.Error(err))
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
@@ -160,8 +205,27 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetTrades(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	trades := s.engine.GetRecentTrades(100)
-	json.NewEncoder(w).Encode(trades)
+		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	})
+}
+
+// checkOrigin validates the Origin header against the allowed origins list.
+// If no Origin header is present, the request is allowed (non-browser clients).
+// If the Origin header is present, it must match an allowed origin exactly.
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// Non-browser client or same-origin request; allow
+		return true
+	}
+
+	allowed := getAllowedOrigins()
+	if len(allowed) == 0 {
+		// No allowed origins configured; reject for safety
+		return false
+	}
+
+	return isOriginAllowed(origin, allowed)
 }
 
 func (s *Server) handleGetDepth(w http.ResponseWriter, r *http.Request) {

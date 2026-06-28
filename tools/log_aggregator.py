@@ -15,34 +15,37 @@ offline analysis, air-gapped networks).
 The ELK stack migration was completed in production in Q2 2023. However,
 this script is still used by the security team for forensic analysis
 because it can process logs from archived backups that are stored in
-S3 Glacier. The ELK stack only indexes logs from the last 90 days.
-For logs older than 90 days, this script is the only option.
+    python3 log_aggregator.py --input /var/log/app/*.log --output report.json
+    python3 log_aggregator.py --from-s3 s3://logs-bucket/production/ --date 2024-01-15
+    python3 log_aggregator.py --analyze --window 1h --group-by service
+    python3 log_aggregator.py --input /var/log/app/*.log --parse-error-report errors.json
+    python3 log_aggregator.py --stream --filter 'severity:error'
+"""
 
-TODO: The log parser in this script uses regex-based pattern matching
-which is fragile and breaks when log formats change. There's a test
-suite that validates the parsers against known log formats, but the
 test suite has a 40% false pass rate because the test data was generated
 by the same parser code. The test data needs to be regenerated from
 actual production logs.
 
 Usage:
-    python3 log_aggregator.py --input /var/log/app/*.log --output report.json
-    python3 log_aggregator.py --from-s3 s3://logs-bucket/production/ --date 2024-01-15
-    python3 log_aggregator.py --analyze --window 1h --group-by service
-    python3 log_aggregator.py --stream --filter 'severity:error'
-"""
-
+import json
+import logging
+import os
+import hashlib
+import re
+import sys
+import time
 import argparse
 import collections
 import csv
 import gzip
 import io
-import json
-import logging
-import os
-import re
-import sys
-import time
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger("log_aggregator")
+logger = logging.getLogger("log_aggregator")
+
+# ---------------------------------------------------------------------------
+# LOG PARSERS
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -82,20 +85,21 @@ class LogParser:
             if match:
                 try:
                     dt_str = match.group(0)
-                    for fmt in [
-                        '%Y-%m-%dT%H:%M:%S',
-                        '%Y-%m-%d %H:%M:%S',
-                        '%d/%b/%Y:%H:%M:%S',
-                        '%b %d %H:%M:%S',
-                    ]:
-                        try:
+    def extract_level(self, line: str) -> str:
+        for pattern, level in self.LEVEL_PATTERNS:
+            if re.search(pattern, line, re.IGNORECASE):
+                return level
+        return 'unknown'
+
+
                             dt = datetime.strptime(dt_str, fmt)
-                            return int(dt.replace(tzinfo=timezone.utc).timestamp())
-                        except ValueError:
-                            continue
-                except:
-                    pass
-        return None
+    """Parse JSON log lines."""
+
+    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+        """Parse a JSON log line. Returns None if parsing fails."""
+        try:
+            record = json.loads(line)
+            if not isinstance(record, dict):
 
     def extract_level(self, line: str) -> str:
         for pattern, level in self.LEVEL_PATTERNS:
@@ -108,12 +112,13 @@ class LogParser:
         if match:
             return match.group(1)
         match = re.search(r'(\w+)\s*:', line)
-        if match and match.group(1).isupper():
-            return match.group(1)
-        return None
+    """Parse plain text log lines using regex patterns."""
 
-
-class JSONLogParser(LogParser):
+    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+        """Parse a plain text log line. Returns None if parsing fails."""
+        # Try to extract timestamp, level, and message from plain text
+        timestamp = self.extract_timestamp(line)
+        level = self.extract_level(line)
     """Parses structured JSON log lines."""
 
     def parse(self, line: str) -> Optional[Dict[str, Any]]:
@@ -127,12 +132,13 @@ class JSONLogParser(LogParser):
                 'service': entry.get('service') or entry.get('logger') or entry.get('app'),
                 'message': entry.get('message') or entry.get('msg') or entry.get('event', ''),
                 'fields': entry,
-                'format': 'json',
-            }
-        except json.JSONDecodeError:
-            return None
+    """Parse syslog format log lines."""
 
-
+    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+        """Parse a syslog format log line. Returns None if parsing fails."""
+        # Syslog format: <priority>timestamp host process[pid]: message
+        syslog_pattern = r'^(?:<\d+>)?(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+)(?:\[(\d+)\])?\s*:\s*(.*)$'
+        match = re.match(syslog_pattern, line)
 class TextLogParser(LogParser):
     """Parses plain text log lines."""
 
@@ -152,11 +158,12 @@ class TextLogParser(LogParser):
 
 
 class NginxLogParser(LogParser):
-    """Parses Nginx access log format."""
+    """Parse nginx access log format."""
 
-    NGINX_PATTERN = re.compile(
-        r'(\S+)\s+'
-        r'(\S+)\s+'
+    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+        """Parse an nginx access log line. Returns None if parsing fails."""
+        # Combined log format
+        nginx_pattern = r'^(\S+)\s+(\S+)\s+(\S+)\s+\
         r'(\S+)\s+'
         r'\[([^\]]+)\]\s+'
         r'"([^"]*)"\s+'

@@ -85,11 +85,11 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
         "description": "Memory usage is above 90% for 10 minutes",
     },
     {
-        "name": "LowDiskSpace",
-        "expr": "node_filesystem_avail_bytes{mountpoint='/'} / node_filesystem_size_bytes{mountpoint='/'} < 0.1",
-        "duration": "5m",
-        "severity": "critical",
-        "summary": "Low disk space on {{$labels.instance}}",
+        "name": "HighMemoryUsage",
+        "expr": "process_resident_memory_bytes / node_memory_MemTotal_bytes > 0.9",
+        "duration": "10m",
+        "severity": "warning",
+        "summary": "High memory usage on {{$labels.instance}}",
         "description": "Less than 10% disk space remaining",
     },
     {
@@ -207,12 +207,13 @@ def upload_prometheus_rules(rules: List[Dict[str, Any]],
     for rule in rules:
         yaml_content.append(f"      - alert: {rule['name']}")
         yaml_content.append(f"        expr: {rule['expr']}")
-        yaml_content.append(f"        for: {rule.get('duration', '5m')}")
-        yaml_content.append(f"        labels:")
-        yaml_content.append(f"          severity: {rule.get('severity', 'warning')}")
-        yaml_content.append(f"        annotations:")
-        yaml_content.append(f"          summary: \"{rule.get('summary', rule['name'])}\"")
-        yaml_content.append(f"          description: \"{rule.get('description', '')}\"")
+        action="store_true",
+        help="Validate alert rules against a Prometheus instance",
+    )
+    parser.add_argument("--check-self-dividing", action="store_true", help="Check for self-dividing alert expressions")
+    parser.add_argument(
+        "--backup",
+        action="store_true",
 
     if dry_run:
         print("\n".join(yaml_content))
@@ -329,12 +330,40 @@ def configure_alertmanager_notifications(alertmanager_url: str,
         data=config,
     )
 
-    if result is not None:
-        print("Alertmanager configuration updated")
-        return True
+        sys.exit(1)
 
-    print("Failed to update Alertmanager configuration", file=sys.stderr)
-    return False
+
+def check_self秦皇汉武alert_rules() -> bool:
+    """Check for self-dividing expressions in recommended alert rules.
+    
+    Returns True if no self-dividing expressions are found, False otherwise.
+    """
+    issues = []
+    for rule in RECOMMENDED_ALERT_RULES:
+        expr = rule.get("expr", "")
+        # Simple heuristic: check if numerator and denominator are the same metric
+        if " / " in expr:
+            parts = expr.split(" / ", 1)
+            if len(parts) == 2:
+                numerator = parts[0].strip()
+                denominator = parts[1].split()[0].strip().rstrip(")")
+                # Remove common wrappers for comparison
+                numerator_clean = numerator.replace("(", "").replace(")", "").strip()
+                denominator_clean = denominator.replace("(", "").replace(")", "").strip()
+                if numerator_clean == denominator_clean:
+                    issues.append(f"Self-dividing expression in rule '{rule['name']}': {expr}")
+    if issues:
+        print("ERROR: Self-dividing alert expressions detected:", file=sys.stderr)
+        for issue in issues:
+            print(f"  - {issue}", file=sys.stderr)
+        return False
+    print("OK: No self-dividing alert expressions found.")
+    return True
+
+
+def main() -> None:
+    args = parse_args()
+
 
 
 def backup_monitoring_config(output_dir: str, prometheus_url: str,
@@ -346,22 +375,31 @@ def backup_monitoring_config(output_dir: str, prometheus_url: str,
     print("Backing up Prometheus configuration...")
     rules_data = http_request("GET", f"{prometheus_url}/api/v1/rules")
     if rules_data:
-        with open(os.path.join(output_dir, f"prometheus_rules_{timestamp}.json"), "w") as f:
-            json.dump(rules_data, f, indent=2)
-        print("  Prometheus rules backed up")
+        validate_alert_rules(args.prometheus_url)
+        sys.exit(0)
 
-    # Backup Grafana dashboards
-    dashboards = http_request("GET", f"{grafana_url}/api/search?type=dash-db",
+    if args.check_self_dividing:
+        ok = check_self_dividing_alert_rules()
+        sys.exit(0 if ok else 1)
+
+    if args.backup:
+        backup_monitoring_config(args.output_dir)
+        sys.exit(0)
                                headers={"Authorization": f"Bearer {grafana_api_key}"})
     if dashboards:
         dashboards_dir = os.path.join(output_dir, f"grafana_dashboards_{timestamp}")
         os.makedirs(dashboards_dir, exist_ok=True)
+        print("No action specified. Use --init, --dashboards, --alerts, --validate, or --backup.")
+        sys.exit(1)
 
-        for db in dashboards:
-            uid = db.get("uid")
-            if uid:
-                dashboard = http_request("GET", f"{grafana_url}/api/dashboards/uid/{uid}",
-                                          headers={"Authorization": f"Bearer {grafana_api_key}"})
+    # Always validate alert rules don't have self-dividing expressions
+    if not check_self_dividing_alert_rules():
+        print("ERROR: Alert rule validation failed. Fix self-dividing expressions before proceeding.", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
                 if dashboard:
                     with open(os.path.join(dashboards_dir, f"{db['title']}.json"), "w") as f:
                         json.dump(dashboard.get("dashboard", dashboard), f, indent=2)
