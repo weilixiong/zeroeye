@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -152,6 +153,29 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
 ]
 
 
+PROMQL_SERIES_PATTERN = r"[a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^{}]*\})?"
+SELF_DIVISION_PATTERN = re.compile(
+    rf"(?P<series>{PROMQL_SERIES_PATTERN})\s*/\s*(?P=series)(?![a-zA-Z0-9_:])"
+)
+
+
+def validate_alert_rules(rules: List[Dict[str, Any]]) -> List[str]:
+    errors: List[str] = []
+
+    for index, rule in enumerate(rules, start=1):
+        name = rule.get("name") or f"rule #{index}"
+        expr = rule.get("expr")
+
+        if not isinstance(expr, str) or not expr.strip():
+            errors.append(f"{name}: missing PromQL expression")
+            continue
+
+        if SELF_DIVISION_PATTERN.search(expr):
+            errors.append(f"{name}: expression divides a metric by itself: {expr}")
+
+    return errors
+
+
 def http_request(method: str, url: str, data: Any = None,
                  headers: Optional[Dict[str, str]] = None) -> Any:
     if headers is None:
@@ -200,6 +224,13 @@ def check_alertmanager(url: str) -> bool:
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
+    validation_errors = validate_alert_rules(rules)
+    if validation_errors:
+        print("Alert rule validation failed:", file=sys.stderr)
+        for error in validation_errors:
+            print(f"  - {error}", file=sys.stderr)
+        return False
+
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
 
@@ -414,13 +445,13 @@ def main():
                 args.alertmanager_url, args.slack_webhook,
                 args.pagerduty_key, args.dry_run)
 
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
+        if not upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run):
+            return 1
         print("Monitoring initialization complete")
         return 0
 
     if args.alerts:
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
-        return 0
+        return 0 if upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run) else 1
 
     if args.backup:
         return 0 if backup_monitoring_config(
@@ -429,6 +460,14 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        validation_errors = validate_alert_rules(RECOMMENDED_ALERT_RULES)
+        if validation_errors:
+            print("  recommended alert rules: FAILED")
+            for error in validation_errors:
+                print(f"    - {error}")
+            return 1
+
+        print("  recommended alert rules: OK")
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
@@ -448,4 +487,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
