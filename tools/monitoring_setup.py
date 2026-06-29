@@ -29,6 +29,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -152,6 +153,59 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
 ]
 
 
+def validate_alert_expression(expr: str) -> List[str]:
+    """Validate a PromQL alert expression and catch common errors.
+
+    Returns a list of error messages if problems are found.
+    """
+    errors = []
+
+    # Check for self-dividing expressions like: metric / metric
+    # This pattern catches: process_resident_memory_bytes / process_resident_memory_bytes
+    self_divide_pattern = r'(\w+)\s*/\s*\1\b'
+    matches = re.findall(self_divide_pattern, expr)
+    for match in matches:
+        errors.append(
+            f"Self-dividing expression detected: '{match} / {match}' "
+            f"always evaluates to 1 for non-zero values. "
+            f"Use a different denominator (e.g., machine_memory_bytes, node_memory_MemTotal_bytes)."
+        )
+
+    # Check for empty expressions
+    if not expr or not expr.strip():
+        errors.append("Empty alert expression")
+
+    # Check for basic PromQL syntax (should contain at least one metric or function)
+    if not re.search(r'[a-zA-Z_:][a-zA-Z0-9_:]*', expr):
+        errors.append("Expression does not contain any valid PromQL identifiers")
+
+    return errors
+
+
+def validate_all_alert_rules(rules: List[Dict[str, Any]]) -> bool:
+    """Validate all alert rules and report any issues.
+
+    Returns True if all rules are valid, False otherwise.
+    """
+    all_valid = True
+    print("Validating alert rules...")
+
+    for rule in rules:
+        name = rule.get("name", "unnamed")
+        expr = rule.get("expr", "")
+        errors = validate_alert_expression(expr)
+
+        if errors:
+            all_valid = False
+            print(f"  [FAIL] {name}:")
+            for error in errors:
+                print(f"    - {error}")
+        else:
+            print(f"  [OK] {name}")
+
+    return all_valid
+
+
 def http_request(method: str, url: str, data: Any = None,
                  headers: Optional[Dict[str, str]] = None) -> Any:
     if headers is None:
@@ -200,6 +254,11 @@ def check_alertmanager(url: str) -> bool:
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
+    # Validate rules before uploading
+    if not validate_all_alert_rules(rules):
+        print("Alert validation failed. Fix the errors above before uploading.", file=sys.stderr)
+        return False
+
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
 
@@ -388,12 +447,17 @@ def parse_args():
     parser.add_argument("--backup", action="store_true", help="Backup monitoring config")
     parser.add_argument("--output-dir", default="./monitoring_backup", help="Backup output directory")
     parser.add_argument("--validate", action="store_true", help="Validate monitoring configuration")
+    parser.add_argument("--validate-alerts", action="store_true", help="Validate alert expressions only")
     parser.add_argument("--env", default="development", help="Target environment")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.validate_alerts:
+        valid = validate_all_alert_rules(RECOMMENDED_ALERT_RULES)
+        return 0 if valid else 1
 
     if args.check:
         print("Checking monitoring infrastructure...")
