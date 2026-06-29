@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -197,9 +198,32 @@ def check_alertmanager(url: str) -> bool:
     return False
 
 
+def find_self_dividing_alerts(rules: List[Dict[str, Any]]) -> List[str]:
+    offenders = []
+    metric_division = re.compile(
+        r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s*/\s*\1(?:\{[^}]*\})?\b"
+    )
+
+    for rule in rules:
+        expr = str(rule.get("expr", ""))
+        if metric_division.search(expr):
+            offenders.append(str(rule.get("name", "<unnamed>")))
+
+    return offenders
+
+
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
+    self_dividing_alerts = find_self_dividing_alerts(rules)
+    if self_dividing_alerts:
+        print(
+            "Refusing to upload self-dividing alert expressions: "
+            + ", ".join(self_dividing_alerts),
+            file=sys.stderr,
+        )
+        return False
+
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
 
@@ -414,13 +438,14 @@ def main():
                 args.alertmanager_url, args.slack_webhook,
                 args.pagerduty_key, args.dry_run)
 
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
+        if not upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run):
+            return 1
         print("Monitoring initialization complete")
         return 0
 
     if args.alerts:
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
-        return 0
+        return 0 if upload_prometheus_rules(
+            RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run) else 1
 
     if args.backup:
         return 0 if backup_monitoring_config(
