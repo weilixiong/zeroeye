@@ -212,19 +212,20 @@ class LogAggregator:
         self.error_patterns: Counter = Counter()
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
+        self.parse_errors: List[Dict[str, Any]] = []
 
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
         try:
             if filepath.endswith('.gz'):
                 with gzip.open(filepath, 'rt', errors='replace') as f:
-                    for line in f:
-                        if self._parse_line(line):
+                    for line_num, line in enumerate(f, 1):
+                        if self._parse_line(line, filepath, line_num):
                             parsed_count += 1
             else:
                 with open(filepath, 'r', errors='replace') as f:
-                    for line in f:
-                        if self._parse_line(line):
+                    for line_num, line in enumerate(f, 1):
+                        if self._parse_line(line, filepath, line_num):
                             parsed_count += 1
         except Exception as e:
             logger.error(f"Error processing {filepath}: {e}")
@@ -240,27 +241,87 @@ class LogAggregator:
             logger.debug(f"  {filepath.name}: {count} entries")
         return total
 
-    def _parse_line(self, line: str) -> bool:
-        for parser in self.parsers:
-            entry = parser.parse(line)
-            if entry:
-                self.entries.append(entry)
-                ts = entry.get('timestamp')
-                if ts:
-                    hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
-                    self.hourly_counts[hour] += 1
-                level = entry.get('level', 'unknown').lower()
-                self.level_counts[level] += 1
-                service = entry.get('service', 'unknown')
-                self.service_counts[service] += 1
-                if level in ('error', 'critical'):
-                    msg = entry.get('message', '')
-                    if len(msg) > 200:
-                        msg = msg[:200]
-                    self.errors_by_service[service].append(msg)
-                    self.error_patterns[msg] += 1
-                return True
+    def _parse_line(self, line: str, filepath: str = "unknown", line_num: int = 0) -> bool:
+        is_json_expected = line.strip().startswith('{') or filepath.endswith('.json') or filepath.endswith('.jsonl')
+        is_nginx_expected = 'nginx' in filepath.lower() or 'access.log' in filepath.lower()
+
+        parsers_to_try = list(self.parsers)
+        if is_nginx_expected:
+            nginx_parsers = [p for p in parsers_to_try if isinstance(p, NginxLogParser)]
+            other_parsers = [p for p in parsers_to_try if not isinstance(p, NginxLogParser)]
+            parsers_to_try = nginx_parsers + other_parsers
+
+        for parser in parsers_to_try:
+            if isinstance(parser, JSONLogParser):
+                try:
+                    entry = json.loads(line.strip())
+                    if not isinstance(entry, dict):
+                        if is_json_expected:
+                            self.parse_errors.append({
+                                'parser_type': 'json',
+                                'file_path': filepath,
+                                'line_number': line_num,
+                                'error_message': 'Parsed JSON is not a dictionary'
+                            })
+                        continue
+                    
+                    formatted_entry = {
+                        'timestamp': entry.get('timestamp') or entry.get('time') or entry.get('@timestamp'),
+                        'level': entry.get('level') or entry.get('severity') or entry.get('lvl', 'info'),
+                        'service': entry.get('service') or entry.get('logger') or entry.get('app'),
+                        'message': entry.get('message') or entry.get('msg') or entry.get('event', ''),
+                        'fields': entry,
+                        'format': 'json',
+                    }
+                    self.entries.append(formatted_entry)
+                    self._update_counts(formatted_entry)
+                    return True
+                except json.JSONDecodeError as e:
+                    if is_json_expected:
+                        self.parse_errors.append({
+                            'parser_type': 'json',
+                            'file_path': filepath,
+                            'line_number': line_num,
+                            'error_message': str(e)
+                        })
+                    continue
+            elif isinstance(parser, NginxLogParser):
+                entry = parser.parse(line)
+                if entry:
+                    self.entries.append(entry)
+                    self._update_counts(entry)
+                    return True
+                elif is_nginx_expected and line.strip():
+                    self.parse_errors.append({
+                        'parser_type': 'nginx',
+                        'file_path': filepath,
+                        'line_number': line_num,
+                        'error_message': 'Line does not match Nginx log pattern'
+                    })
+                    continue
+            else:
+                entry = parser.parse(line)
+                if entry:
+                    self.entries.append(entry)
+                    self._update_counts(entry)
+                    return True
         return False
+
+    def _update_counts(self, entry: Dict[str, Any]):
+        ts = entry.get('timestamp')
+        if ts:
+            hour = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:00')
+            self.hourly_counts[hour] += 1
+        level = entry.get('level', 'unknown').lower()
+        self.level_counts[level] += 1
+        service = entry.get('service', 'unknown')
+        self.service_counts[service] += 1
+        if level in ('error', 'critical'):
+            msg = entry.get('message', '')
+            if len(msg) > 200:
+                msg = msg[:200]
+            self.errors_by_service[service].append(msg)
+            self.error_patterns[msg] += 1
 
     def get_summary(self) -> Dict[str, Any]:
         return {
@@ -411,6 +472,7 @@ def parse_args():
     parser.add_argument("--output", "-o", default="log_report.json", help="Output file path")
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
+    parser.add_argument("--parse-error-report", help="Path to write JSON parse-error report")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
 
@@ -458,6 +520,14 @@ def main():
         aggregator.generate_html_report(args.output)
     else:
         aggregator.export_json(args.output)
+
+    if args.parse_error_report:
+        with open(args.parse_error_report, 'w') as f:
+            json.dump({
+                'parse_errors': aggregator.parse_errors,
+                'total_errors': len(aggregator.parse_errors)
+            }, f, indent=2)
+        logger.info(f"Parse error report written to {args.parse_error_report}")
 
     return 0
 
