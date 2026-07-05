@@ -78,7 +78,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -441,6 +441,14 @@ def main():
             else:
                 print(f"  {url}: FAILED")
                 all_ok = False
+                
+        print("Validating alert expressions...")
+        import re
+        for rule in RECOMMENDED_ALERT_RULES:
+            if re.search(r'\b([a-zA-Z_:][a-zA-Z0-9_:]*)\s*/\s*\1\b', rule['expr']):
+                print(f"  Alert rule '{rule['name']}' FAILED validation: self-dividing expression", file=sys.stderr)
+                all_ok = False
+                
         return 0 if all_ok else 1
 
     parser.print_help()
