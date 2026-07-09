@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -42,6 +43,14 @@ DEFAULT_GRAFANA_URL = "http://localhost:3000"
 
 DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "dashboards")
 ALERT_RULES_DIR = os.path.join(os.path.dirname(__file__), "..", "monitoring", "alerts")
+METRIC_NAME_RE = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
+SELF_DIVISION_RE = re.compile(
+    rf"\b({METRIC_NAME_RE})(?:\s*\{{[^{{}}]*\}})?\s*/\s*"
+    rf"(?:on\s*\([^)]*\)\s*)?"
+    rf"(?:ignoring\s*\([^)]*\)\s*)?"
+    rf"(?:group_(?:left|right)(?:\s*\([^)]*\))?\s*)?"
+    rf"({METRIC_NAME_RE})(?:\s*\{{[^{{}}]*\}})?\b"
+)
 
 RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     {
@@ -78,7 +87,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / on(instance) group_left machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -146,10 +155,28 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
     {"name": "job:http_requests_total:rate5m", "expr": "sum(rate(http_requests_total[5m])) by (job)"},
     {"name": "job:http_error_rate:rate5m", "expr": "sum(rate(http_errors_total[5m])) by (job) / sum(rate(http_requests_total[5m])) by (job)"},
     {"name": "job:http_latency_p99:rate5m", "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job))"},
-    {"name": "instance:memory_usage:ratio", "expr": "process_resident_memory_bytes / machine_memory_bytes"},
+    {"name": "instance:memory_usage:ratio", "expr": "process_resident_memory_bytes / on(instance) group_left machine_memory_bytes"},
     {"name": "instance:cpu_usage:ratio", "expr": "rate(process_cpu_seconds_total[5m])"},
     {"name": "service:uptime:days", "expr": "time() - process_start_time_seconds{job=~'.+'}"},
 ]
+
+
+def find_self_dividing_expressions(rules: List[Dict[str, Any]]) -> List[str]:
+    """Return rule names whose expressions divide the same metric by itself."""
+    errors = []
+    for rule in rules:
+        expr = str(rule.get("expr", ""))
+        for lhs_metric, rhs_metric in SELF_DIVISION_RE.findall(expr):
+            if lhs_metric == rhs_metric:
+                name = rule.get("name", "<unnamed>")
+                errors.append(
+                    f"{name}: expression divides {lhs_metric} by itself"
+                )
+    return errors
+
+
+def validate_alert_rules(rules: List[Dict[str, Any]]) -> List[str]:
+    return find_self_dividing_expressions(rules)
 
 
 def http_request(method: str, url: str, data: Any = None,
@@ -200,6 +227,13 @@ def check_alertmanager(url: str) -> bool:
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
+    validation_errors = validate_alert_rules(rules)
+    if validation_errors:
+        print("Invalid Prometheus alert rules:", file=sys.stderr)
+        for error in validation_errors:
+            print(f"  - {error}", file=sys.stderr)
+        return False
+
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
 
@@ -414,13 +448,14 @@ def main():
                 args.alertmanager_url, args.slack_webhook,
                 args.pagerduty_key, args.dry_run)
 
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
+        if not upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run):
+            return 1
         print("Monitoring initialization complete")
         return 0
 
     if args.alerts:
-        upload_prometheus_rules(RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run)
-        return 0
+        return 0 if upload_prometheus_rules(
+            RECOMMENDED_ALERT_RULES, args.prometheus_url, args.dry_run) else 1
 
     if args.backup:
         return 0 if backup_monitoring_config(
