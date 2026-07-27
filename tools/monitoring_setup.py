@@ -78,7 +78,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -443,7 +443,7 @@ def main():
                 all_ok = False
         return 0 if all_ok else 1
 
-    parser.print_help()
+    print("No valid action specified. Use --help for usage information.")
     return 0
 
 
