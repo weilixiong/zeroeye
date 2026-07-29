@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -152,6 +153,34 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
 ]
 
 
+def find_self_dividing_metrics(expr: str) -> List[str]:
+    pattern = re.compile(
+        r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)\b"
+        r"(?:\s*\{[^}]*\})?"
+        r"\s*/\s*"
+        r"\b\1\b"
+        r"(?:\s*\{[^}]*\})?"
+    )
+    return [match.group(1) for match in pattern.finditer(expr)]
+
+
+def validate_alert_rule_expressions(rules: List[Dict[str, Any]]) -> bool:
+    ok = True
+    for rule in rules:
+        expr = rule.get("expr", "")
+        repeated_metrics = find_self_dividing_metrics(expr)
+        if repeated_metrics:
+            ok = False
+            metrics = ", ".join(sorted(set(repeated_metrics)))
+            print(
+                f"Invalid alert rule {rule.get('name', '<unnamed>')}: "
+                f"expression divides a metric by itself ({metrics})",
+                file=sys.stderr,
+            )
+
+    return ok
+
+
 def http_request(method: str, url: str, data: Any = None,
                  headers: Optional[Dict[str, str]] = None) -> Any:
     if headers is None:
@@ -200,6 +229,9 @@ def check_alertmanager(url: str) -> bool:
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
                             dry_run: bool = False) -> bool:
+    if not validate_alert_rule_expressions(rules):
+        return False
+
     rules_file = "/etc/prometheus/rules/tent_rules.yml"
     print(f"{'Would upload' if dry_run else 'Uploading'} {len(rules)} rules to {prometheus_url}")
 
@@ -388,6 +420,7 @@ def parse_args():
     parser.add_argument("--backup", action="store_true", help="Backup monitoring config")
     parser.add_argument("--output-dir", default="./monitoring_backup", help="Backup output directory")
     parser.add_argument("--validate", action="store_true", help="Validate monitoring configuration")
+    parser.add_argument("--validate-rules", action="store_true", help="Validate built-in alert rule expressions")
     parser.add_argument("--env", default="development", help="Target environment")
     return parser.parse_args()
 
@@ -400,6 +433,13 @@ def main():
         prom_ok = check_prometheus(args.prometheus_url)
         am_ok = check_alertmanager(args.alertmanager_url)
         return 0 if (prom_ok and am_ok) else 1
+
+    if args.validate_rules:
+        print("Validating built-in alert rule expressions...")
+        if validate_alert_rule_expressions(RECOMMENDED_ALERT_RULES):
+            print("  Alert rule expressions: OK")
+            return 0
+        return 1
 
     if args.init:
         print("Initializing monitoring setup for environment: {args.env}")
@@ -429,11 +469,11 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        all_ok = validate_alert_rule_expressions(RECOMMENDED_ALERT_RULES)
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
         ]
-        all_ok = True
         for url in configs_to_check:
             result = http_request("GET", f"{url}/-/healthy")
             if result:
