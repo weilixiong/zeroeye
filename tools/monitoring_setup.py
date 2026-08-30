@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
 """
+import re
 Monitoring setup and configuration tool for the Tent of Trials platform.
 Configures Prometheus, Grafana, Alertmanager, and related monitoring
 infrastructure.
-
+        "expr": "process_resident_memory_bytes / node_memory_MemTotal_bytes > 0.9",
 This tool automates the setup of monitoring dashboards, alert rules,
 and notification channels. It can be run in standalone mode or as part
 of the deployment pipeline.
 
-WARNING: This script interacts with live monitoring infrastructure and
+            "description": "Process resident memory exceeds 90% of total node memory"
 can cause alert storms if misconfigured. Always use the --dry-run flag
 first to see what changes would be made. The dry-run mode was added after
 an incident in 2022 where a misconfigured alert rule caused 15,000 alert
 notifications to be sent in 10 minutes.
+SELF_DIVIDE_PATTERN = re.compile(
+    r"\b([a-zA-Z_:][a-zA-Z0-9_:]*)\s*/\s*\1\b"
+)
 
+def validate_alert_expressions(alerts: dict) -> None:
+    """Raise ValueError if any alert expression divides a metric by itself."""
+    for name, rule in alerts.items():
+        expr = rule.get("expr", "")
+        if SELF_DIVIDE_PATTERN.search(expr):
+            raise ValueError(
+                f"Alert '{name}' contains self-dividing expression: {expr}"
+            )
+
+
+    validate_alert_expressions(ALERTS)
 Usage:
     python3 monitoring_setup.py --init --env production
     python3 monitoring_setup.py --dashboards --prometheus-url http://localhost:9090
