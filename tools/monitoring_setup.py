@@ -78,7 +78,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -150,6 +150,54 @@ RECOMMENDED_RECORDING_RULES: List[Dict[str, Any]] = [
     {"name": "instance:cpu_usage:ratio", "expr": "rate(process_cpu_seconds_total[5m])"},
     {"name": "service:uptime:days", "expr": "time() - process_start_time_seconds{job=~'.+'}"},
 ]
+
+
+def find_self_dividing_alerts(rules: List[Dict[str, Any]]) -> List[str]:
+    """Return names of alert rules whose expr divides a metric by itself.
+
+    Catches regressions like `metric / metric > threshold`, which always
+    evaluates to 1 for nonzero values. Compares bare metric names on both
+    sides of `/`, ignoring labels (e.g. `{...}`), whitespace, and a trailing
+    comparison (e.g. `> 0.9`).
+    """
+    import re
+
+    violations: List[str] = []
+    for rule in rules:
+        expr = str(rule.get("expr", ""))
+        # Take the ratio part before any comparison operator.
+        ratio = re.split(r"[><=!~]", expr, maxsplit=1)[0]
+        if "/" not in ratio:
+            continue
+        left, right = ratio.split("/", 1)
+
+        def base_metric(side: str) -> str:
+            side = side.strip()
+            # Take metric-like tokens, ignoring PromQL functions, keywords,
+            # and single-letter time units (e.g. the `m` in `[5m]`).
+            ignore = {
+                "sum", "rate", "avg", "by", "without", "on",
+                "histogram_quantile", "time", "label_replace",
+            }
+            tokens = [
+                t for t in re.findall(r"[a-zA-Z_:][a-zA-Z0-9_:]*", side)
+                if len(t) > 2 and t not in ignore
+            ]
+            return tokens[-1] if tokens else ""
+
+        if base_metric(left) and base_metric(left) == base_metric(right):
+            violations.append(str(rule.get("name", "<unnamed>")))
+    return violations
+
+
+def validate_alert_rules(rules: List[Dict[str, Any]]) -> bool:
+    """Validate alert exprs; return False if a self-dividing ratio is found."""
+    violations = find_self_dividing_alerts(rules)
+    if violations:
+        print(f"Invalid self-dividing alert expr in: {', '.join(violations)}",
+              file=sys.stderr)
+        return False
+    return True
 
 
 def http_request(method: str, url: str, data: Any = None,
@@ -429,11 +477,15 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        all_ok = validate_alert_rules(RECOMMENDED_ALERT_RULES)
+        if all_ok:
+            print("  alert rules: OK")
+        else:
+            print("  alert rules: FAILED")
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
         ]
-        all_ok = True
         for url in configs_to_check:
             result = http_request("GET", f"{url}/-/healthy")
             if result:
