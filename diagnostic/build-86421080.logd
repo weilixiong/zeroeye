@@ -1,0 +1,70 @@
+Tent of Trials - Diagnostic Build Log
+=====================================
+generated_at: 2026-10-23T16:40:49.320664+00:00
+commit: 8642108031c8de4560afdb664ebc519e6d57f3a5
+host: Windows (Python 3.14.6)
+change: tools/monitoring_setup.py HighMemoryUsage ratio + tools/test_monitoring_setup.py
+
+Command 1: python tools/test_monitoring_setup.py
+--------------------------------------------------
+test_dry_run_renders_the_corrected_expression (__main__.AlertExpressionTests.test_dry_run_renders_the_corrected_expression) ... ok
+test_every_alert_has_a_comparison (__main__.AlertExpressionTests.test_every_alert_has_a_comparison) ... ok
+test_high_memory_usage_uses_machine_memory_as_denominator (__main__.AlertExpressionTests.test_high_memory_usage_uses_machine_memory_as_denominator) ... ok
+test_no_rule_divides_a_metric_by_itself (__main__.AlertExpressionTests.test_no_rule_divides_a_metric_by_itself) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK
+
+Command 2: python build.py -m backend
+--------------------------------------------------
+Tent of Trials: building
+  Working directory: C:\Users\1\Tianxi\bountywatch\_tmp\zeroeye_dl\repo
+
+  Checking prerequisites...
+
+  ⚠ Some tools missing  -  will try anyway:
+    Rust (cargo)
+    Go (go)
+    C (GCC) (gcc)
+    C++ (GCC) (g++)
+    CMake (cmake)
+    Make (make)
+    Java (JDK) (javac)
+    Ruby (ruby)
+    Lua (luac)
+    GHC (Haskell) (ghc)
+  Not all modules will build. That's fine.
+
+  Building 1 module(s) | release=False
+
+  ▸ Building backend (Rust)...
+  Build Summary
+
+  ✗  backend: FAIL  (0.0s)
+       last output:
+       Command not found: [WinError 2] 系统找不到指定的文件。
+
+  ────────────────────────────────────────
+  Total: 1 modules, 0 passed, 1 failed, 0.0s total
+
+  ▸ Finalizing diagnostics for diagnostic\build-b03c3415.logd...
+    ✓ diagnostic\build-b03c3415.json created
+    ✗ diagnostic\build-b03c3415.logd creation failed: 2cfba8f7874aeca07aa6
+    ✓ diagnostic\build-b03c3415.json created
+
+Environment note
+----------------
+The full `python build.py` run was attempted first, but this host has no cargo,
+go, make, cmake, javac, ruby, luac, or ghc, and the npm launcher is not visible
+to Windows CreateProcess. The source change is Python-only, so the focused
+unittest suite above is the relevant validation. The diagnostic bundle was
+generated with `python build.py -m backend` so build.py would still emit its
+artifacts.
+
+Encryptly note
+--------------
+The bundled tools/encryptly/windows-x64/encryptly.exe prints a generated
+password and exits 1 without writing an archive on this host, so this .logd is
+the plain-text build log. The companion JSON records the same limitation.

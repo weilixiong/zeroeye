@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-10-23T16:40:49.320664+00:00",
+  "commit": "86421080",
+  "diagnostic_logd": "diagnostic/build-86421080.logd",
+  "diagnostic_logd_error": "encryptly.exe exits 1 on Windows and writes no archive; this .logd is the plain-text build log.",
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": null,
+  "decrypt_command": null,
+  "total_modules": 1,
+  "passed": 0,
+  "failed": 1,
+  "modules": [
+    {
+      "name": "backend",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: cargo (Rust toolchain not installed on the diagnostic host)"
+    }
+  ],
+  "tests": {
+    "command": "python tools/test_monitoring_setup.py",
+    "result": "4 tests OK",
+    "exit_code": 0
+  },
+  "host_note": "Full multi-language build unavailable on Windows (no cargo/go/make/cmake/javac/ruby/luac/ghc; npm launcher not visible to CreateProcess). The change is Python-only and covered by the focused unittest suite.",
+  "pr_note": "Include this JSON and diagnostic/build-86421080.logd in the PR. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
