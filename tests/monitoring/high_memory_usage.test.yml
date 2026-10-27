@@ -1,0 +1,253 @@
+{
+  "rule_files": [
+    "generated-rules.yml"
+  ],
+  "evaluation_interval": "1m",
+  "tests": [
+    {
+      "name": "resident memory below threshold",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "500x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "exactly ninety percent does not fire",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "900x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "above threshold waits ten minutes",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "950x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "9m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "above threshold fires after ten minutes",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "950x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "10m",
+          "exp_samples": [
+            {
+              "labels": "{__name__=\"ALERTS\", alertname=\"HighMemoryUsage\", alertstate=\"firing\", instance=\"app:9000\", job=\"app\", severity=\"warning\"}",
+              "value": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "zero resident memory does not fire",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "0x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "zero capacity does not divide by zero",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "500x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "0x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "negative capacity is invalid",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "500x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "-1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "missing capacity cannot establish memory pressure",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "500x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "different instances cannot match",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "950x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"other:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    },
+    {
+      "name": "each instance uses its own capacity",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "950x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x12"
+        },
+        {
+          "series": "process_resident_memory_bytes{instance=\"other:9000\",job=\"app\"}",
+          "values": "500x12"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"other:9000\",job=\"app\"}",
+          "values": "1000x12"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": [
+            {
+              "labels": "{__name__=\"ALERTS\", alertname=\"HighMemoryUsage\", alertstate=\"firing\", instance=\"app:9000\", job=\"app\", severity=\"warning\"}",
+              "value": 1
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "short peak clears the pending alert",
+      "interval": "1m",
+      "input_series": [
+        {
+          "series": "process_resident_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "950x4 500x10"
+        },
+        {
+          "series": "machine_memory_bytes{instance=\"app:9000\",job=\"app\"}",
+          "values": "1000x14"
+        }
+      ],
+      "promql_expr_test": [
+        {
+          "expr": "ALERTS{alertname=\"HighMemoryUsage\",alertstate=\"firing\"}",
+          "eval_time": "11m",
+          "exp_samples": []
+        }
+      ]
+    }
+  ]
+}

@@ -78,11 +78,13 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        # Same-target capacity, as in the recommended memory recording rule.
+        # Filtering invalid capacity avoids infinite ratios from division by zero.
+        "expr": "process_resident_memory_bytes / (machine_memory_bytes > 0) > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
-        "description": "Memory usage is above 90% for 10 minutes",
+        "description": "Process resident memory is above 90% of machine capacity for 10 minutes",
     },
     {
         "name": "LowDiskSpace",
