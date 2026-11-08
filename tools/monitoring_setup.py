@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -78,7 +79,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / node_memory_MemTotal_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -195,6 +196,50 @@ def check_alertmanager(url: str) -> bool:
         return True
     print(f"Alertmanager is NOT healthy at {url}")
     return False
+
+
+def validate_self_dividing_expressions(rules: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """
+    Validate that alert rules do not contain self-dividing PromQL expressions
+    (e.g., metric / metric > threshold).
+    Returns a list of error messages for any invalid rules found.
+    """
+    if rules is None:
+        rules = RECOMMENDED_ALERT_RULES
+
+    errors: List[str] = []
+    metric_div_pattern = re.compile(
+        r'([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?)\s*/\s*([a-zA-Z_:][a-zA-Z0-9_:]*(?:\{[^}]*\})?)'
+    )
+
+    for rule in rules:
+        name = rule.get("name", "Unknown")
+        expr = rule.get("expr", "")
+
+        found_error = False
+        for match in metric_div_pattern.finditer(expr):
+            numerator, denominator = match.group(1).strip(), match.group(2).strip()
+            if numerator == denominator:
+                errors.append(
+                    f"Rule '{name}' has self-dividing expression: '{numerator} / {denominator}' in '{expr}'"
+                )
+                found_error = True
+                break
+
+        if not found_error and " / " in expr:
+            lhs = expr
+            for comp_op in [">=", "<=", "==", "!=", ">", "<"]:
+                if comp_op in expr:
+                    lhs = expr.split(comp_op, 1)[0].strip()
+                    break
+            if " / " in lhs:
+                parts = [p.strip() for p in lhs.split(" / ")]
+                if len(parts) == 2 and parts[0] == parts[1]:
+                    errors.append(
+                        f"Rule '{name}' has self-dividing expression: '{parts[0]} / {parts[1]}' in '{expr}'"
+                    )
+
+    return errors
 
 
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
@@ -429,11 +474,20 @@ def main():
 
     if args.validate:
         print("Validating monitoring configuration...")
+        all_ok = True
+
+        expr_errors = validate_self_dividing_expressions(RECOMMENDED_ALERT_RULES)
+        if expr_errors:
+            for err in expr_errors:
+                print(f"  EXPRESSION ERROR: {err}")
+            all_ok = False
+        else:
+            print("  Alert rules expression validation: OK")
+
         configs_to_check = [
             args.prometheus_url,
             args.alertmanager_url,
         ]
-        all_ok = True
         for url in configs_to_check:
             result = http_request("GET", f"{url}/-/healthy")
             if result:
