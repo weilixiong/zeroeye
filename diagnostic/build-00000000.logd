@@ -1,1 +1,9 @@
-stub diagnostic logd placeholder
+[INFO] Starting build process...
+[INFO] Running tools/monitoring_setup.py validation...
+Starting monitoring setup...
+Alert rules validated successfully.
+  - HighMemoryUsage: process_resident_memory_bytes / node_memory_MemTotal_bytes > 0.9
+  - HighCPUUsage: rate(process_cpu_seconds_total[5m]) > 0.8
+Monitoring setup completed.
+[INFO] Validation passed.
+[INFO] Diagnostic artifacts generated.
